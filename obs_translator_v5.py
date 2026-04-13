@@ -42,7 +42,7 @@ import scipy.signal as signal
 # CONFIGURATION & CONSTANTS
 # ============================================================================
 
-VERSION = "5.10.0"
+VERSION = "5.12.0"
 PLUGIN_NAME = "OBS Translator"
 DEFAULT_SAMPLERATE = 44100
 TARGET_SAMPLERATE = 16000
@@ -103,8 +103,34 @@ _handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message
 _logger.addHandler(_handler)
 
 def log(msg: str, level: int = obs.LOG_INFO) -> None:
-    """Wrapper for OBS script logging"""
+    """Thread-safe logging wrapper"""
+    if _obs_api_disabled:
+        return
     _logger.log(level, msg)
+
+def _process_log_queue() -> None:
+    """Process queued log messages from threads"""
+    if _obs_api_disabled:
+        return
+    
+    while not _log_queue.empty():
+        try:
+            level, msg = _log_queue.get_nowait()
+            _logger.log(level, msg)
+        except queue.Empty:
+            break
+        except Exception:
+            pass
+
+# Thread-safe log queue
+_log_queue: queue.Queue = queue.Queue(maxsize=100)
+
+def thread_log(msg: str, level: int = obs.LOG_INFO) -> None:
+    """Thread-safe logging from worker threads - queues message for main thread"""
+    try:
+        _log_queue.put_nowait((level, msg))
+    except queue.Full:
+        pass
 
 # ============================================================================
 # GLOBAL STATE (Thread-Safe)
@@ -134,6 +160,11 @@ _WORD_SPLIT_REGEX = re.compile(r'\s+')
 
 # OBS API safety flag - when True, all OBS API calls are blocked
 _obs_api_disabled = False
+
+# Translation cache to reduce API calls
+_TRANSLATION_CACHE: Dict[str, str] = {}
+_MAX_CACHE_SIZE = 1000
+_CACHE_CLEANUP_THRESHOLD = 1000
 
 # ============================================================================
 # EXCEPTIONS
@@ -323,6 +354,58 @@ def save_custom_slang(slang: Dict[str, str]) -> bool:
         return True
     except IOError:
         return False
+
+
+def cached_translate(translator: Any, text: str, src_lang: str, tgt_lang: str) -> str:
+    """
+    Translate text with caching to reduce API calls.
+    Returns cached translation if available, otherwise translates and caches.
+    """
+    if not text or len(text.strip()) < 2:
+        return text
+    
+    cache_key = f"{src_lang}_{tgt_lang}_{hash(text)}"
+    
+    if cache_key in _TRANSLATION_CACHE:
+        return _TRANSLATION_CACHE[cache_key]
+    
+    try:
+        result = translator.translate(text)
+        result = " ".join(result.split())
+        
+        _TRANSLATION_CACHE[cache_key] = result
+        
+        if len(_TRANSLATION_CACHE) > _MAX_CACHE_SIZE:
+            keys_to_remove = list(_TRANSLATION_CACHE.keys())[:200]
+            for key in keys_to_remove:
+                del _TRANSLATION_CACHE[key]
+        
+        return result
+    except Exception:
+        return text
+
+
+def cleanup_memory() -> None:
+    """
+    Cleanup memory periodically to prevent leaks in long sessions.
+    Called by timer every 30 minutes.
+    """
+    global _TRANSLATION_CACHE
+    
+    try:
+        if len(_TRANSLATION_CACHE) > _CACHE_CLEANUP_THRESHOLD // 2:
+            keys_to_remove = list(_TRANSLATION_CACHE.keys())[:100]
+            for key in keys_to_remove:
+                del _TRANSLATION_CACHE[key]
+        
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        
+    except Exception:
+        pass
 
 
 def add_slang_word(source: str, target: str) -> bool:
@@ -1051,11 +1134,11 @@ class AudioSTTWorker(threading.Thread):
             import sounddevice as sd
             
             # Load model
-            log(f"Loading model: {Path(self.model_path).name}")
+            thread_log(f"Loading model: {Path(self.model_path).name}")
             model = Model(self.model_path)
             rec = KaldiRecognizer(model, TARGET_SAMPLERATE)
             rec.SetWords(True)
-            log(f"Model loaded: {self.src_lang} -> {self.tgt_lang}")
+            thread_log(f"Model loaded: {self.src_lang} -> {self.tgt_lang}")
             
             # Start translation thread
             translator_thread = TranslatorThread(
@@ -1066,10 +1149,10 @@ class AudioSTTWorker(threading.Thread):
                 self.auto_detect
             )
             translator_thread.start()
-            log("Translation thread started")
+            thread_log("Translation thread started")
             
             # Open audio stream
-            log(f"Opening audio: {self.samplerate}Hz, blocksize={self.blocksize}")
+            thread_log(f"Opening audio: {self.samplerate}Hz, blocksize={self.blocksize}")
             restart_attempts = 0
             max_restart_attempts = 5
             
@@ -1100,17 +1183,17 @@ class AudioSTTWorker(threading.Thread):
                                 blocksize=self.blocksize
                             )
                             self._stream.start()
-                            log("Audio stream started", obs.LOG_INFO)
+                            thread_log("Audio stream started", obs.LOG_INFO)
                             restart_attempts = 0
                             self._mic_disconnected = False
                         except Exception as e:
                             restart_attempts += 1
                             if self.auto_restart and restart_attempts < max_restart_attempts:
-                                log(f"Mic reconnect attempt {restart_attempts}/{max_restart_attempts}...", obs.LOG_WARNING)
+                                thread_log(f"Mic reconnect attempt {restart_attempts}/{max_restart_attempts}...", obs.LOG_WARNING)
                                 time.sleep(2)
                                 continue
                             else:
-                                log(f"Cannot open audio stream: {e}", obs.LOG_ERROR)
+                                thread_log(f"Cannot open audio stream: {e}", obs.LOG_ERROR)
                                 break
                     
                     # Check shutdown before blocking read
@@ -1126,7 +1209,7 @@ class AudioSTTWorker(threading.Thread):
                             self._stream = None
                             break
                         # Otherwise, try to reconnect
-                        log(f"Audio read error: {e}", obs.LOG_WARNING)
+                        thread_log(f"Audio read error: {e}", obs.LOG_WARNING)
                         self._stream = None
                         continue
                     
@@ -1192,7 +1275,7 @@ class AudioSTTWorker(threading.Thread):
                     if self._stream_close_requested or not self._running:
                         break
                     if "Input overflow" in str(e) or "Device unavailable" in str(e):
-                        log("Mic disconnected, attempting reconnect...", obs.LOG_WARNING)
+                        thread_log("Mic disconnected, attempting reconnect...", obs.LOG_WARNING)
                         self._mic_disconnected = True
                         self._stream = None
                         if self.auto_restart:
@@ -1200,27 +1283,17 @@ class AudioSTTWorker(threading.Thread):
                             continue
                     raise
                 except Exception as e:
-                    log(f"Audio error: {e}", obs.LOG_WARNING)
+                    thread_log(f"Audio error: {e}", obs.LOG_WARNING)
                     time.sleep(0.01)
             
         except ImportError as e:
-            log(f"Missing dependency: {e}", obs.LOG_ERROR)
+            thread_log(f"Missing dependency: {e}", obs.LOG_ERROR)
         except Exception as e:
             if self._running:
-                log(f"Worker critical error: {e}", obs.LOG_ERROR)
+                thread_log(f"Worker critical error: {e}", obs.LOG_ERROR)
         finally:
             self._running = False
-            
-            # Cleanup stream using thread-safe method
-            self.close_stream()
-            
-            # Signal translator to stop
-            self._translation_queue.put_nowait(('stop', ''))
-            
-            if translator_thread:
-                translator_thread.join(timeout=2)
-            
-            log("Worker stopped")
+            thread_log("Worker stopped")
     
     def _finalize(self) -> None:
         """Finalize current speech segment - prevents duplicates"""
@@ -1388,7 +1461,7 @@ class TranslatorThread(threading.Thread):
                 source=self._src_lang,
                 target=self._tgt_lang
             )
-            log("Translator initialized")
+            thread_log("Translator initialized")
             
             while self._running and not _state.is_exiting and not _state.shutdown_event.is_set():
                 try:
@@ -1403,12 +1476,12 @@ class TranslatorThread(threading.Thread):
                 except queue.Empty:
                     continue
                 except Exception as e:
-                    log(f"Translation loop error: {e}", obs.LOG_WARNING)
+                    thread_log(f"Translation loop error: {e}", obs.LOG_WARNING)
                     
         except ImportError:
-            log("deep_translator not available", obs.LOG_ERROR)
+            thread_log("deep_translator not available", obs.LOG_ERROR)
         except Exception as e:
-            log(f"Translator thread error: {e}", obs.LOG_ERROR)
+            thread_log(f"Translator thread error: {e}", obs.LOG_ERROR)
     
     def _translate(self, translator: Any, text: str) -> None:
         """Translate text and update history with auto-detect support"""
@@ -1423,7 +1496,7 @@ class TranslatorThread(threading.Thread):
             if self._auto_detect and detected_lang == self._tgt_lang:
                 trans = text
             else:
-                trans = translator.translate(text)
+                trans = cached_translate(translator, text, self._src_lang, self._tgt_lang)
             
             trans = " ".join(trans.split())
             
@@ -1453,7 +1526,7 @@ class TranslatorThread(threading.Thread):
             with _state.worker_lock:
                 if self._worker.running:
                     self._worker._last_error = str(e)[:50]
-            log(f"Translation error: {e}", obs.LOG_WARNING)
+            thread_log(f"Translation error: {e}", obs.LOG_WARNING)
 
 # ============================================================================
 # MODEL DOWNLOAD
@@ -1673,6 +1746,9 @@ def _update_ui_from_queue() -> None:
         if _obs_api_disabled:
             return
         
+        # Process queued log messages from threads FIRST
+        _process_log_queue()
+        
         # GUARD: Never update UI during shutdown
         if _state.is_exiting or _state.shutdown_event.is_set():
             return
@@ -1748,6 +1824,26 @@ def script_unload() -> None:
             except Exception:
                 pass
             _state.text_queue = None
+        
+        # Clear translation cache
+        global _TRANSLATION_CACHE
+        _TRANSLATION_CACHE.clear()
+        
+        # Clear log queue
+        try:
+            while not _log_queue.empty():
+                try:
+                    _log_queue.get_nowait()
+                except queue.Empty:
+                    break
+        except Exception:
+            pass
+        
+        # Stop memory cleanup timer
+        try:
+            obs.timer_remove(cleanup_memory)
+        except Exception:
+            pass
         
         # Stop worker thread
         try:
@@ -1843,11 +1939,20 @@ def _start_translator() -> bool:
         )
         _state.translation_worker.start()
     
+    # Start memory cleanup timer (every 30 minutes)
+    obs.timer_add(cleanup_memory, 30 * 60 * 1000)
+    
     log("Translator active")
     return True
 
 def _stop_translator() -> None:
     """Stop the translator"""
+    # Stop memory cleanup timer
+    try:
+        obs.timer_remove(cleanup_memory)
+    except Exception:
+        pass
+    
     with _state.worker_lock:
         if _state.translation_worker:
             _state.translation_worker.stop()
