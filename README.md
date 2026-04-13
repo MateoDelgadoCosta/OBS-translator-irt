@@ -47,40 +47,29 @@ This plugin requires manual installation for **your security**:
 
 **Step 2: Install Dependencies**
 1. Open **Command Prompt** (Win+R, type `cmd`, Enter)
-2. Run these commands one by one:
+2. Run this command:
 ```
 pip install numpy scipy sounddevice vosk deep_translator fast-langdetect
 ```
 
-**Step 3: Download Speech Models**
-1. Create folder: `%APPDATA%\OBS_Translator\models\`
-2. Download English model:
-   - Go to: https://alphacephei.com/vosk/models
-   - Download: `vosk-model-en-us-0.22-lgraph` (~1.2GB)
-   - Extract ZIP to: `%APPDATA%\OBS_Translator\models\`
-   - Rename folder to: `vosk-model-en-us-0.22-lgraph`
-3. Download Spanish model:
-   - Download: `vosk-model-es-0.42` (~1.4GB)
-   - Extract ZIP to: `%APPDATA%\OBS_Translator\models\`
-   - Rename folder to: `vosk-model-es-0.42`
-
-**Step 4: Install OBS Script**
+**Step 3: Install OBS Script**
 1. Create folder: `%APPDATA%\obs-studio\obs-plugins\obs-scripting\python_scripts\`
 2. Copy `obs_translator_v5.py` to that folder
 
-**Step 5: Configure OBS**
+**Step 4: Configure OBS**
 1. Open OBS Studio
 2. Go to **Tools > Scripts**
 3. Click **+** button
 4. Select `obs_translator_v5.py`
 5. Configure microphone and language
-6. Click **START**
+6. Click **"DOWNLOAD MODELS"** button (downloads speech models)
+7. Click **START**, wait until it says listening in the text on the screen
 
 ## Usage
 
 ### Setup Display Source
 
-**Important**: Make sure to **select a source** in the script's dropdown before clicking START, otherwise text won't appear.
+**Important**: Make sure to **select a font** in the script's dropdown on both before clicking START, otherwise text won't appear.
 
 The translator automatically creates two text sources:
 1. **Translator_Source** - Shows recognized speech
@@ -154,7 +143,6 @@ Fixed in v5.5+. If still happening, click STOP before closing OBS.
 | File | Description |
 |------|-------------|
 | `obs_translator_v5.py` | Main OBS script |
-| `download_models.py` | Model downloader (optional) |
 | `README.md` | This file |
 
 ## Data Location
