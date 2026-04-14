@@ -58,10 +58,16 @@ COMPRESSOR_RATIO = 3.0
 HIGH_PASS_FREQ_HZ = 80
 PREEMPHASIS_ALPHA = 0.97
 CONFIDENCE_THRESHOLD = 0.3
-FINALIZATION_SILENCE_MS = 700
+FINALIZATION_SILENCE_MS = 100  # Reduced from 700ms for faster finalization
 FINALIZATION_SPEECH_MAX_MS = 30000
 NOISE_FLOOR_ALPHA = 0.01
 NOISE_PROFILE_ALPHA = 0.99
+
+# Chunk processing for real-time transcription (Option A)
+CHUNK_INTERVAL_SEC = 5.0      # Process chunk every 5 seconds of speech
+CHUNK_OVERLAP_SEC = 1.0      # Keep 1s overlap between chunks to not lose words
+MAX_CHUNK_SIZE_SEC = 15       # Max 15s per chunk (VRAM limit)
+PREVIEW_DISPLAY_SEC = 3.0    # Show preview for 3s before updating
 
 # Model URLs
 MODEL_URLS = {
@@ -74,6 +80,120 @@ MODEL_URLS = {
         "es": "https://alphacephei.com/vosk/models/vosk-model-es-0.42.zip"
     }
 }
+
+# faster-whisper Model Configuration
+WHISPER_MODELS = {
+    "tiny": {"params": 39, "vram_gb": 1, "speed": 10},
+    "base": {"params": 74, "vram_gb": 1, "speed": 7},
+    "small": {"params": 244, "vram_gb": 2, "speed": 4},
+    "medium": {"params": 769, "vram_gb": 5, "speed": 2},
+    "large-v3": {"params": 1550, "vram_gb": 10, "speed": 1},
+}
+WHISPER_DEFAULT = "small"
+WHISPER_CACHE_DIR = str(Path.home() / ".cache" / "whisper_models")
+
+# Hysteresis Audio Gate (per Requirement 4)
+VAD_OPEN_DB = -50.0   # Open gate: start speaking
+VAD_CLOSE_DB = -65.0   # Close gate: stop speaking
+VAD_HYSTERESIS_DB = VAD_OPEN_DB - VAD_CLOSE_DB  # 15dB hysteresis
+
+# Latency threshold for fallback (ms)
+MAX_TRANSCRIPTION_LATENCY_MS = 5000  # 5 seconds max
+
+# ============================================================================
+# GPU MANAGER (per Requirement 2)
+# ============================================================================
+
+class GPUManager:
+    """
+    Intelligent GPU monitoring with pynvml.
+    Implements feedback loop for engine selection.
+    """
+    
+    _instance = None
+    _nvml = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._init_nvml()
+        return cls._instance
+    
+    def _init_nvml(self) -> None:
+        """Initialize pynvml"""
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._nvml = pynvml
+            self._handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        except ImportError:
+            self._nvml = None
+        except Exception:
+            self._nvml = None
+    
+    def get_vram_available_gb(self) -> float:
+        """Returns available VRAM in GB"""
+        if not self._nvml:
+            return 0.0
+        try:
+            info = self._nvml.nvmlDeviceGetMemoryInfo(self._handle)
+            available_gb = info.free / 1e9
+            return float(available_gb)
+        except Exception:
+            return 0.0
+    
+    def get_utilization(self) -> float:
+        """Returns GPU utilization percentage (0-100)"""
+        if not self._nvml:
+            return 0.0
+        try:
+            util = self._nvml.nvmlDeviceGetUtilizationRates(self._handle)
+            return float(util.gpu)
+        except Exception:
+            return 0.0
+    
+    def select_engine_config(self) -> dict:
+        """
+        Feedback loop: Select engine based on GPU status.
+        Returns: {engine, device, compute_type}
+        """
+        vram = self.get_vram_available_gb()
+        util = self.get_utilization()
+        
+        # Requirement 2: IF GPU Utilization < 70% and VRAM sufficient
+        if vram >= 4.0 and util < 70:
+            return {
+                "engine": "faster-whisper",
+                "device": "cuda",
+                "compute_type": "float16"
+            }
+        
+        # IF GPU overloaded or unavailable: CPU mode
+        if vram >= 1.0:
+            return {
+                "engine": "faster-whisper", 
+                "device": "cpu",
+                "compute_type": "int8"
+            }
+        
+        # IF all fails: Vosk fallback
+        return {
+            "engine": "vosk",
+            "device": "cpu",
+            "compute_type": "default"
+        }
+    
+    def shutdown(self) -> None:
+        """Cleanup pynvml"""
+        if self._nvml:
+            try:
+                self._nvml.nvmlShutdown()
+            except Exception:
+                pass
+            self._nvml = None
+
+# Global GPU manager
+_gpu_manager = GPUManager()
 
 # ============================================================================
 # LOGGING SETUP
@@ -648,7 +768,7 @@ def update_text_source(
     text: str, 
     settings: Any, 
     prefix: str,
-    max_width: int = 480,
+    max_width: int = 360,
     max_height: int = 100
 ) -> bool:
     """
@@ -682,28 +802,28 @@ def update_text_source(
             # Text content
             obs.obs_data_set_string(source_settings, "text", text)
             
-            # Layout constraints - use extents for text wrapping
+            # Layout constraints - ALWAYS set these explicitly
             obs.obs_data_set_bool(source_settings, "wordwrap", True)
             obs.obs_data_set_int(source_settings, "extents", 1)
             obs.obs_data_set_int(source_settings, "extents_cx", max_width)
             obs.obs_data_set_int(source_settings, "extents_cy", max_height)
-            obs.obs_data_set_int(source_settings, "align", 1)  # Center horizontal
-            obs.obs_data_set_int(source_settings, "valign", 1)  # Center vertical
+            obs.obs_data_set_int(source_settings, "align", 1)
+            obs.obs_data_set_int(source_settings, "valign", 1)
             
-            # Background
-            bg_color = obs.obs_data_get_int(settings, f"{prefix}_bg_color")
-            bg_opacity = obs.obs_data_get_int(settings, f"{prefix}_bg_opacity")
+            # Background - with safe defaults
+            bg_color = obs.obs_data_get_int(settings, f"{prefix}_bg_color") if settings else 0
+            bg_opacity = obs.obs_data_get_int(settings, f"{prefix}_bg_opacity") if settings else 100
             obs.obs_data_set_int(source_settings, "bk_color", bg_color)
             obs.obs_data_set_int(source_settings, "bk_opacity", int(bg_opacity * 2.55))
             
-            # Font
-            font_size = obs.obs_data_get_int(settings, f"{prefix}_font_size")
-            font_obj = obs.obs_data_get_obj(settings, f"{prefix}_font")
+            # Font - with safe defaults
+            font_size = obs.obs_data_get_int(settings, f"{prefix}_font_size") if settings else 48
+            font_obj = obs.obs_data_get_obj(settings, f"{prefix}_font") if settings else None
             
             font_props = obs.obs_data_create()
             obs.obs_data_set_string(font_props, "face", "Arial")
             obs.obs_data_set_int(font_props, "size", font_size)
-            obs.obs_data_set_int(font_props, "style", 400)  # Normal weight
+            obs.obs_data_set_int(font_props, "style", 400)
             obs.obs_data_set_int(font_props, "weight", 400)
             obs.obs_data_set_obj(source_settings, "font", font_props)
             obs.obs_data_release(font_props)
@@ -711,8 +831,8 @@ def update_text_source(
             if font_obj:
                 obs.obs_data_release(font_obj)
             
-            # Text color
-            text_color = obs.obs_data_get_int(settings, f"{prefix}_text_color")
+            # Text color - with safe defaults
+            text_color = obs.obs_data_get_int(settings, f"{prefix}_text_color") if settings else 0
             obs.obs_data_set_int(source_settings, "color", text_color)
             
             # Apply settings
@@ -787,6 +907,187 @@ def ensure_source(name: str) -> Optional[Any]:
         return None
 
 # ============================================================================
+# STT ENGINE (faster-whisper + Vosk fallback)
+# ============================================================================
+
+class STTResult:
+    """Result container for STT transcription"""
+    def __init__(self, text: str = "", confidence: float = 0.0, is_final: bool = False):
+        self.text = text
+        self.confidence = confidence
+        self.is_final = is_final
+
+class STTEngine:
+    """
+    Unified STT Engine interface.
+    Primary: faster-whisper (Large-v3)
+    Fallback: Vosk Kaldi
+    
+    Requirement 2: Implements intelligent fallback based on GPU status.
+    """
+    
+    def __init__(self, model_size: str = WHISPER_DEFAULT, src_lang: str = "en"):
+        self.model_size = model_size
+        self.src_lang = src_lang
+        self._whisper_model = None
+        self._vosk_recognizer = None
+        self._current_engine = None
+        self._load_time_ms = 0
+    
+    def load(self, engine: str = None, device: str = None, compute_type: str = None) -> bool:
+        """
+        Load STT engine based on configuration.
+        
+        Args:
+            engine: "faster-whisper" or "vosk"
+            device: "cuda" or "cpu"  
+            compute_type: "float16", "int8", or "default"
+        
+        Returns:
+            True if loaded successfully
+        """
+        import time
+        start = time.time()
+        
+        # Auto-select if not specified (use GPU feedback loop)
+        if engine is None:
+            config = _gpu_manager.select_engine_config()
+            engine = config["engine"]
+            device = config["device"]
+            compute_type = config["compute_type"]
+        
+        if engine == "faster-whisper":
+            return self._load_whisper(device, compute_type)
+        else:
+            return self._load_vosk()
+    
+    def _load_whisper(self, device: str, compute_type: str) -> bool:
+        """Load faster-whisper model"""
+        try:
+            from faster_whisper import WhisperModel
+            
+            thread_log(f"Loading faster-whisper {self.model_size} on {device} ({compute_type})...")
+            self._whisper_model = WhisperModel(
+                self.model_size,
+                device=device,
+                compute_type=compute_type
+            )
+            self._current_engine = "faster-whisper"
+            self._load_time_ms = (time.time() - start) * 1000
+            thread_log(f"Whisper loaded in {self._load_time_ms:.0f}ms")
+            return True
+            
+        except ImportError:
+            thread_log("faster-whisper not installed, trying Vosk fallback...")
+            return self._load_vosk()
+        except Exception as e:
+            thread_log(f"Whisper load failed: {e}, using Vosk fallback")
+            return self._load_vosk()
+    
+    def _load_vosk(self) -> bool:
+        """Load Vosk as fallback"""
+        import time
+        start = time.time()
+        
+        try:
+            from vosk import Model, KaldiRecognizer
+            
+            # Find model - use model_size as language hint for backward compat
+            model_path = find_model(self.src_lang, self.model_size)
+            if not model_path:
+                thread_log(f"No Vosk model found for {self.src_lang}")
+                return False
+            
+            thread_log(f"Loading Vosk model: {model_path}...")
+            model = Model(str(model_path))
+            self._vosk_recognizer = KaldiRecognizer(model, TARGET_SAMPLERATE)
+            self._vosk_recognizer.SetWords(True)
+            self._current_engine = "vosk"
+            self._load_time_ms = (time.time() - start) * 1000
+            thread_log(f"Vosk loaded in {self._load_time_ms:.0f}ms")
+            return True
+            
+        except ImportError:
+            thread_log("Vosk not installed")
+            return False
+        except Exception as e:
+            thread_log(f"Vosk load failed: {e}")
+            return False
+    
+    def transcribe(self, audio_int16: np.ndarray) -> STTResult:
+        """
+        Transcribe audio buffer.
+        
+        Requirement 2: If latency exceeds threshold, trigger fallback.
+        
+        Args:
+            audio_int16: Audio as int16 numpy array (16kHz)
+            
+        Returns:
+            STTResult with text, confidence, is_final
+        """
+        import time
+        start = time.time()
+        
+        try:
+            if self._current_engine == "faster-whisper" and self._whisper_model:
+                # faster-whisper transcription
+                segments, info = self._whisper_model.transcribe(
+                    audio_int16,
+                    language=None,  # Auto-detect
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_d_ms=700)
+                )
+                
+                text_parts = []
+                confidence = info.probability
+                for segment in segments:
+                    text_parts.append(segment.text)
+                
+                text = " ".join(text_parts).strip()
+                latency_ms = (time.time() - start) * 1000
+                
+                # Requirement 2: If latency exceeds threshold, log for feedback
+                if latency_ms > MAX_TRANSCRIPTION_LATENCY_MS:
+                    thread_log(f"High latency: {latency_ms}ms (threshold: {MAX_TRANSCRIPTION_LATENCY_MS}ms)")
+                
+                return STTResult(text=text, confidence=confidence, is_final=True)
+                
+            elif self._current_engine == "vosk" and self._vosk_recognizer:
+                # Vosk transcription  
+                audio_bytes = audio_int16.tobytes()
+                if self._vosk_recognizer.AcceptWaveform(audio_bytes):
+                    result = json.loads(self._vosk_recognizer.Result())
+                    text = result.get("text", "")
+                    return STTResult(text=text, confidence=0.7, is_final=True)
+                else:
+                    partial = self._vosk_recognizer.PartialResult()
+                    result = json.loads(partial)
+                    return STTResult(text=result.get("partial", ""), confidence=0.0, is_final=False)
+            
+            else:
+                return STTResult()
+                
+        except Exception as e:
+            thread_log(f"Transcription error: {e}")
+            # Requirement 2: IF Whisper fails, trigger Vosk fallback
+            if self._current_engine == "faster-whisper":
+                thread_log("Switching to Vosk fallback...")
+                if self._load_vosk():
+                    return self.transcribe(audio_int16)
+            return STTResult()
+    
+    @property
+    def engine_name(self) -> str:
+        return self._current_engine or "none"
+    
+    def unload(self) -> None:
+        """Unload model to free memory"""
+        self._whisper_model = None
+        self._vosk_recognizer = None
+        self._current_engine = None
+
+# ============================================================================
 # AUDIO PROCESSING
 # ============================================================================
 
@@ -822,10 +1123,11 @@ class AudioProcessor:
         self.z_hp = np.zeros(2)
         self.last_sample_pe = 0.0
         
-        # VAD state
+        # Requirement 4: Hysteresis VAD (open: -50dB, close: -65dB)
         self.vad_noise_floor = -70.0
         self.vad_hangover_frames = int(samplerate * VAD_HANGOVER_MS / 1000 / blocksize)
         self.vad_hangover_count = 0
+        self.vad_is_open = False
         
         # Noise profiling
         self.noise_profile: Optional[np.ndarray] = None
@@ -1031,12 +1333,14 @@ class AudioSTTWorker(threading.Thread):
         adaptive_vocab: bool,
         auto_restart: bool,
         show_confidence: bool,
+        model_size: str = "small",
         auto_detect: bool = True
     ):
         super().__init__(daemon=True)
         
         self.mic_id = mic_id
         self.model_path = model_path
+        self.model_size = model_size
         self.src_lang, self.tgt_lang = mode.split('_')
         self.samplerate = samplerate
         self.audio_gate_db = audio_gate_db
@@ -1050,6 +1354,9 @@ class AudioSTTWorker(threading.Thread):
         # Thread safety
         self._running = False
         self._stop_event = threading.Event()
+        
+        # Requirement 1: All attributes initialized in __init__
+        self._stt_engine = None
         
         # Audio config
         self.blocksize = max(1, int(samplerate * BLOCKSIZE_MS / 1000))
@@ -1079,6 +1386,12 @@ class AudioSTTWorker(threading.Thread):
         # Stream management - thread-safe
         self._stream = None
         self._stream_close_requested = False
+        
+        # Chunk processing for real-time transcription (Option A)
+        self._chunk_audio_buffer: List[np.ndarray] = []
+        self._last_chunk_time = 0.0
+        self._last_preview_text = ""
+        self._preview_timestamp = 0.0
         
         log(f"Worker initialized: mic={mic_id}, lang={self.src_lang}->{self.tgt_lang}")
     
@@ -1129,16 +1442,17 @@ class AudioSTTWorker(threading.Thread):
         translator_thread = None
         
         try:
-            # Import dependencies
-            from vosk import Model, KaldiRecognizer
             import sounddevice as sd
             
-            # Load model
-            thread_log(f"Loading model: {Path(self.model_path).name}")
-            model = Model(self.model_path)
-            rec = KaldiRecognizer(model, TARGET_SAMPLERATE)
-            rec.SetWords(True)
-            thread_log(f"Model loaded: {self.src_lang} -> {self.tgt_lang}")
+            # Requirement 2: Use STTEngine with GPU feedback loop
+            thread_log("Initializing STT engine...")
+            self._stt_engine = STTEngine(model_size=self.model_size, src_lang=self.src_lang)
+            
+            if not self._stt_engine.load():
+                thread_log("Failed to load STT engine", obs.LOG_ERROR)
+                return
+            
+            thread_log(f"Engine loaded: {self._stt_engine.engine_name}")
             
             # Start translation thread
             translator_thread = TranslatorThread(
@@ -1223,6 +1537,16 @@ class AudioSTTWorker(threading.Thread):
                     restart_attempts = 0
                     self._mic_disconnected = False
                     
+                    # Calculate durations FIRST (needed for chunk check)
+                    silence_duration = (
+                        current_time - self._silence_start_time 
+                        if self._silence_start_time > 0 else 0
+                    )
+                    speech_duration = (
+                        current_time - self._speech_start_time 
+                        if self._is_speaking and self._speech_start_time > 0 else 0
+                    )
+                    
                     # Process audio
                     processed_audio, is_speaking, db_level = self._audio_processor.process(audio_data)
                     
@@ -1239,20 +1563,23 @@ class AudioSTTWorker(threading.Thread):
                         if not self._is_speaking:
                             self._is_speaking = True
                             self._speech_start_time = current_time
+                            self._chunk_audio_buffer = []  # Reset chunk buffer on new speech
+                            self._last_chunk_time = 0.0
                         self._silence_start_time = 0.0
+                        
+                        # Accumulate audio for chunk processing
+                        self._chunk_audio_buffer.append(vosk_audio)
+                        
+                        # Check if it's time to process a chunk preview
+                        if speech_duration - self._last_chunk_time >= CHUNK_INTERVAL_SEC:
+                            self._process_chunk_preview()
+                            self._last_chunk_time = speech_duration
                     else:
                         if self._is_speaking and self._silence_start_time == 0:
                             self._silence_start_time = current_time
-                    
-                    # Calculate durations
-                    silence_duration = (
-                        current_time - self._silence_start_time 
-                        if self._silence_start_time > 0 else 0
-                    )
-                    speech_duration = (
-                        current_time - self._speech_start_time 
-                        if self._is_speaking and self._speech_start_time > 0 else 0
-                    )
+                        # Clear chunk buffer when not speaking
+                        self._chunk_audio_buffer.clear()
+                        self._last_chunk_time = 0.0
                     
                     # Finalization triggers
                     should_finalize = (
@@ -1260,11 +1587,15 @@ class AudioSTTWorker(threading.Thread):
                         (speech_duration >= FINALIZATION_SPEECH_MAX_MS / 1000 and self._draft_text)
                     )
                     
-                    if should_finalize and current_time - self._last_finalization > 0.5:
+                    # Force UI update on ANY pause (not just finalization)
+                    if silence_duration > 0.05 and self._draft_text:
+                        self._push_update(is_speaking)
+                    
+                    if should_finalize and current_time - self._last_finalization > 0.3:
                         self._finalize()
                         self._last_finalization = current_time
                     else:
-                        self._recognize(rec, vosk_audio, is_speaking)
+                        self._recognize(vosk_audio, is_speaking)
                     
                     # Update UI
                     self._push_update(is_speaking)
@@ -1319,37 +1650,112 @@ class AudioSTTWorker(threading.Thread):
         self._is_speaking = False
         self._speech_start_time = 0.0
     
-    def _recognize(self, rec: Any, audio: np.ndarray, is_speaking: bool) -> None:
-        """Run Vosk recognition"""
-        if rec.AcceptWaveform(audio.tobytes()):
-            result = json.loads(rec.Result())
-            txt = result.get('text', '').strip()
+    def _process_chunk_preview(self) -> None:
+        """Process intermediate chunk in background (no UI display)"""
+        if not self._chunk_audio_buffer or self._stt_engine is None:
+            return
+        
+        try:
+            # Concatenate chunk audio
+            chunk_audio = np.concatenate(self._chunk_audio_buffer)
             
-            if txt:
-                # Confidence check and tracking
-                words = result.get('result', [])
-                if words:
-                    self._confidence = sum(w.get('conf', 0) for w in words) / len(words)
-                    if self._confidence < CONFIDENCE_THRESHOLD:
-                        return
-                else:
-                    self._confidence = 0.5  # Default if no word data
+            # Limit chunk size to prevent memory issues
+            max_samples = int(MAX_CHUNK_SIZE_SEC * TARGET_SAMPLERATE)
+            if len(chunk_audio) > max_samples:
+                chunk_audio = chunk_audio[-max_samples:]
+            
+            # Transcribe chunk
+            result = self._stt_engine.transcribe(chunk_audio)
+            
+            if result.text and result.text != self._last_preview_text:
+                self._last_preview_text = result.text
+                self._preview_timestamp = time.time()
+                # Keep in background - don't show in UI until finalization
+                thread_log(f"Chunk processed (background): {result.text[:30]}...")
+            
+                # Keep last 2 chunks for better context
+                if len(self._chunk_audio_buffer) > 2:
+                    self._chunk_audio_buffer = self._chunk_audio_buffer[-2:]
                 
-                # Learn new words
+        except Exception as e:
+            thread_log(f"Chunk processing error: {e}")
+    
+    def _push_preview(self, text: str) -> None:
+        """Push preview text to UI (without adding to history)"""
+        if _state.is_exiting or _state.shutdown_event.is_set():
+            return
+        
+        try:
+            if _state.text_queue is None:
+                return
+            
+            MAX_CHARS_PER_LINE = 30
+            
+            def wrap_text(txt: str, max_lines: int) -> tuple[str, int]:
+                words = txt.split()
+                lines = []
+                current_line = []
+                current_len = 0
+                
+                for word in words:
+                    word_len = len(word)
+                    if current_len + word_len + len(current_line) <= MAX_CHARS_PER_LINE:
+                        current_line.append(word)
+                        current_len += word_len
+                    else:
+                        if current_line:
+                            lines.append(" ".join(current_line))
+                        current_line = [word]
+                        current_len = word_len
+                
+                if current_line:
+                    lines.append(" ".join(current_line))
+                
+                return "\n".join(lines[:max_lines]), len(lines)
+            
+            # Show preview with "..." to indicate it's not final
+            preview_text = text + "..."
+            s_txt, s_total = wrap_text(preview_text, self.max_lines)
+            
+            # Target shows "Processing..." during preview
+            t_txt = "Processing..."
+            
+            # Don't clear history during preview - that's handled by finalization
+            if s_total > self.max_lines:
+                s_txt = preview_text[:MAX_CHARS_PER_LINE] + "..."
+            
+            _state.text_queue.put_nowait({'s': s_txt, 't': t_txt})
+            
+        except queue.Full:
+            pass
+        except Exception as e:
+            _logger.debug(f"Push preview error: {e}")
+    
+    def _recognize(self, audio: np.ndarray, is_speaking: bool) -> None:
+        """Run STT recognition using STTEngine (faster-whisper or Vosk)"""
+        if self._stt_engine is None:
+            return
+        
+        try:
+            result = self._stt_engine.transcribe(audio)
+            
+            if result.is_final and result.text:
+                self._confidence = result.confidence
+                
+                if self._confidence < CONFIDENCE_THRESHOLD:
+                    return
+                
                 if self.adaptive_vocab:
-                    for word in _WORD_SPLIT_REGEX.split(txt):
+                    for word in _WORD_SPLIT_REGEX.split(result.text):
                         if len(word) > 2:
                             add_to_vocab(self.src_lang, word)
                 
-                self._draft_text = (self._draft_text + " " + txt).strip()
-        else:
-            # Partial result
-            partial_result = rec.PartialResult()
-            partial = json.loads(partial_result).get('partial', '')
-            if partial and is_speaking:
-                self._draft_text = partial.strip()
-                # Estimate confidence for partial (lower)
-                self._confidence = 0.6
+                self._draft_text = (self._draft_text + " " + result.text).strip()
+                thread_log(f"Transcribed: {result.text}")
+            else:
+                self._draft_text = result.text
+        except Exception as e:
+            thread_log(f"Recognition error: {e}")
     
     def _push_update(self, is_speaking: bool) -> None:
         """Push update to UI queue"""
@@ -1361,7 +1767,7 @@ class AudioSTTWorker(threading.Thread):
             if _state.text_queue is None:
                 return
             
-            MAX_CHARS_PER_LINE = 40
+            MAX_CHARS_PER_LINE = 30
             
             def wrap_text(txt: str, max_lines: int) -> tuple[str, int]:
                 words = txt.split()
@@ -1386,39 +1792,34 @@ class AudioSTTWorker(threading.Thread):
                 total_lines = len(lines)
                 return "\n".join(lines[:max_lines]), total_lines
             
-            # Build source text - only show finalized text from history
-            s_lines = self._history_source[-1:] if self._history_source else []
-            if s_lines:
-                s_txt = " ".join(s_lines[-1].split())
+            # Build source text - ALWAYS show the MOST RECENT finalized text
+            if self._history_source:
+                # Get the very last item (most recent)
+                s_txt = self._history_source[-1]
             else:
-                s_txt = "Listening..." if is_speaking else "Waiting..."
+                s_txt = "Say something..."
             
             if self._last_error:
                 s_txt = "[ERR] " + s_txt
             
             s_txt, s_total = wrap_text(s_txt, self.max_lines)
             
-            # Build target text - only show finalized text from history
-            t_lines = self._history_target[-1:] if self._history_target else []
-            if t_lines:
-                t_txt = " ".join(t_lines[-1].split())
+            # Build target text - ALWAYS show the MOST RECENT translation
+            if self._history_target:
+                t_txt = self._history_target[-1]
             else:
                 t_txt = "Ready..."
             
             t_txt, t_total = wrap_text(t_txt, self.max_lines)
             
-            # When content exceeds max lines, clear ALL history and restart
-            # This ensures overflowed content is replaced with fresh text
+            # Keep showing finalized text - don't clear history on overflow
+            # This ensures text stays visible longer
             if s_total > self.max_lines or t_total > self.max_lines:
-                with _state.worker_lock:
-                    # Clear all history to restart fresh
-                    self._history_source.clear()
-                    self._history_target.clear()
-                    # Show placeholder until new speech comes in
-                    s_txt = "Listening..." if is_speaking else "Waiting..."
-                    t_txt = "Ready..."
-                    s_total = 0
-                    t_total = 0
+                # Just truncate, don't clear history
+                s_txt = s_txt.split('\n')[:self.max_lines]
+                s_txt = '\n'.join(s_txt)
+                t_txt = t_txt.split('\n')[:self.max_lines]
+                t_txt = '\n'.join(t_txt)
             
             _state.text_queue.put_nowait({'s': s_txt, 't': t_txt})
             
@@ -1519,6 +1920,13 @@ class TranslatorThread(threading.Thread):
                     if len(self._worker._history_source) > MAX_HISTORY_LINES:
                         self._worker._history_source.pop(0)
                         self._worker._history_target.pop(0)
+                    
+                    # CRITICAL: UI update via timer - just queue the text
+                    if _state.text_queue:
+                        try:
+                            _state.text_queue.put_nowait({'s': text, 't': trans})
+                        except:
+                            pass
                 
                 self._worker._last_error = ""
                 
@@ -1759,25 +2167,21 @@ def _update_ui_from_queue() -> None:
         if _state.script_settings is None:
             return
         
-        while not _state.text_queue.empty():
-            # Double-check shutdown before processing each item
-            if _state.is_exiting or _state.shutdown_event.is_set():
-                return
-            
-            try:
-                data = _state.text_queue.get_nowait()
-            except Exception:
-                break
-            
-            if _state.is_exiting or _state.shutdown_event.is_set():
-                return
-            
-            # Update OBS text sources - THREAD-SAFE
-            try:
-                update_text_source("Translator_Source", data['s'], _state.script_settings, "source")
-                update_text_source("Translator_Target", data['t'], _state.script_settings, "target")
-            except Exception:
-                pass
+        # Get only ONE latest item (not all) to prevent flooding
+        try:
+            data = _state.text_queue.get_nowait()
+        except queue.Empty:
+            return
+        
+        if _state.is_exiting or _state.shutdown_event.is_set():
+            return
+        
+        # Update OBS text sources - THREAD-SAFE
+        try:
+            update_text_source("Translator_Source", data['s'], _state.script_settings, "source")
+            update_text_source("Translator_Target", data['t'], _state.script_settings, "target")
+        except Exception:
+            pass
     except Exception:
         # NEVER let exception propagate to OBS
         pass
@@ -1792,7 +2196,7 @@ def script_load(settings: Any) -> None:
     _state.is_running = False
     _state.script_settings = settings
     _state.text_queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
-    obs.timer_add(_update_ui_from_queue, 100)
+    obs.timer_add(_update_ui_from_queue, 30)  # Update every 30ms for fastest UI
     log(f"Translator v{VERSION} loaded")
 
 def script_unload() -> None:

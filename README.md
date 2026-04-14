@@ -1,4 +1,4 @@
-# OBS Real-Time Speech Translator v5.12
+# OBS Real-Time Speech Translator v7.0
 
 Real-time speech-to-text and translation (English <-> Spanish) plugin for OBS Studio.
 
@@ -17,15 +17,15 @@ This plugin requires manual installation for **your security**:
 
 ## Features
 
-- **Real-time STT**: Offline speech recognition using Vosk
+- **Fast Whisper STT**: GPU-accelerated speech recognition using Faster-Whisper (Large-v3)
+- **Vosk Fallback**: Offline Vosk recognition if GPU unavailable
+- **Smart Engine Switching**: Automatically switches between GPU/CPU/Vosk based on VRAM and GPU utilization
+- **High-Res Audio**: Supports up to 192kHz input with automatic downsampling to 16kHz
+- **Hysteresis Audio Gate**: -50dB open / -65dB close to prevent phrase-chopping
 - **Auto Translation**: Google Translate with caching (reduces API calls)
-- **Auto Language Detection**: Automatically detects EN/ES with fast-langdetect
-- **Translation Cache**: Caches translations to reduce API calls by ~70%
-- **Memory Cleanup**: Automatic cleanup every 30 min for long sessions
-- **Audio Processing**: Noise gate, compression, high-pass filter
-- **Custom Vocabulary**: Add words to improve recognition
-- **Auto-restart**: Automatic mic reconnection
-- **Clean Display**: Text wrapping with line limits
+- **Thread-Safe UI**: All OBS API calls from main thread via queue + timer callback
+- **Memory Safety**: Proper initialization in __init__, clean shutdown sequence
+- **Chunk Processing**: Background processing during speech, only finalized text shown
 
 ## Installation
 
@@ -33,10 +33,16 @@ This plugin requires manual installation for **your security**:
 
 1. Open OBS Studio
 2. Go to **Tools > Scripts**
-3. Click **+**, select `obs_translator_v5.py`
+3. Click **+**, select `obs_translator_v7.py`
 4. Click **"INSTALL DEPS"** button (installs Python packages)
-5. Click **"DOWNLOAD MODELS"** button (downloads speech models)
+5. Click **"DOWNLOAD MODELS"** button (downloads Whisper model)
 6. Select your microphone and click **START**
+
+### Requirements
+
+- **Python**: 3.11+
+- **GPU** (optional): NVIDIA with CUDA for fastest transcription
+- **Dependencies**: faster-whisper, numpy, scipy, sounddevice, deep-translator, pynvml
 
 ### Manual Installation
 
@@ -49,20 +55,20 @@ This plugin requires manual installation for **your security**:
 1. Open **Command Prompt** (Win+R, type `cmd`, Enter)
 2. Run this command:
 ```
-pip install numpy scipy sounddevice vosk deep_translator fast-langdetect
+pip install faster-whisper numpy scipy sounddevice deep-translator pynvml
 ```
 
 **Step 3: Install OBS Script**
 1. Create folder: `%APPDATA%\obs-studio\obs-plugins\obs-scripting\python_scripts\`
-2. Copy `obs_translator_v5.py` to that folder
+2. Copy `obs_translator_v7.py` to that folder
 
 **Step 4: Configure OBS**
 1. Open OBS Studio
 2. Go to **Tools > Scripts**
 3. Click **+** button
-4. Select `obs_translator_v5.py`
+4. Select `obs_translator_v7.py`
 5. Configure microphone and language
-6. Click **"DOWNLOAD MODELS"** button (downloads speech models)
+6. Click **"DOWNLOAD MODELS"** button (downloads speech model)
 7. Click **START**, wait until it says listening in the text on the screen
 
 ## Usage
@@ -85,10 +91,21 @@ Position these sources in your scene. The script updates them automatically.
 |---------|-------------|
 | Microphone | Select your input device |
 | Language | English→Spanish or Spanish→English |
-| Auto-detect | Automatically detects spoken language |
-| Audio Gate | Minimum volume to detect speech (-60 dB default) |
+| Engine | Auto (GPU→CPU→Vosk), Whisper GPU, Whisper CPU, or Vosk |
+| Audio Gate | Minimum volume to detect speech (-50dB open, -65dB close) |
 | Max Lines | Maximum lines to display (wraps after) |
 | Custom Word | Add words to improve recognition |
+
+### Engine Selection
+
+The script automatically selects the best engine based on your GPU:
+- **GPU Available**: Uses Faster-Whisper with CUDA (fastest)
+- **No GPU / GPU Busy**: Falls back to Faster-Whisper CPU (int8 quantization)
+- **Whisper Unavailable**: Falls back to Vosk (offline, slower but reliable)
+
+GPU monitoring checks:
+- VRAM available (>2GB required for GPU mode)
+- GPU utilization (<80% to avoid lag)
 
 ### Auto-Detect Feature
 
@@ -113,37 +130,42 @@ Examples:
 - **Font Size**: 24-100px range
 - **Colors**: Custom text and background colors
 - **Opacity**: Adjustable background transparency
+- **Text Width**: Default 360px (25% less than previous version)
 
 ## Troubleshooting
 
 ### "No model found" Error
 Verify models are in: `%APPDATA%\OBS_Translator\models\`
-- English: `vosk-model-en-us-0.22-lgraph\`
-- Spanish: `vosk-model-spa-0.42\`
+- Faster-Whisper: Models downloaded automatically
 
 ### Text Not Displaying
 1. Check if script is running (click START)
 2. Make sure Translator_Source and Translator_Target sources exist in scene
 3. Try clicking STOP then START again
 
+### GPU Not Being Used
+1. Make sure NVIDIA GPU drivers are installed
+2. Verify CUDA is available (`nvidia-smi`)
+3. Check GPU utilization and VRAM
+
 ### Poor Recognition
-1. Add custom words in the script settings
-2. Use a good quality microphone
-3. Reduce background noise
-4. Speak clearly and at normal pace
+1. Use a good quality microphone
+2. Reduce background noise
+3. Speak clearly and at normal pace
 
 ### Translation Not Working
 Check your internet connection. Google Translate requires internet access.
 
 ### Crash on OBS Close
-Fixed in v5.5+. If still happening, click STOP before closing OBS.
+Fixed. Click STOP before closing OBS for clean shutdown.
 
 ## Files Included
 
 | File | Description |
 |------|-------------|
-| `obs_translator_v5.py` | Main OBS script |
+| `obs_translator_v7.py` | Main OBS script |
 | `README.md` | This file |
+| `obs_translator_v7_backup_UI_FIXED.py` | Backup of stable version |
 
 ## Data Location
 
@@ -158,6 +180,7 @@ MIT License - Free to use and modify.
 
 ## Version History
 
+- **v7.0**: Faster-Whisper (Large-v3) with GPU support, Vosk fallback, thread-safe UI, hysteresis audio gate
 - **v5.12**: Thread-safe logging - OBS API calls only from main thread
 - **v5.11**: Translation cache + memory cleanup for long sessions
 - **v5.10**: OBS API safety flags to prevent crashes
